@@ -3,13 +3,667 @@
 import argparse
 import sys
 import io
-import numpy as np
-from PIL import Image, ImageFilter, ImageCms
 
-from collections import deque
+import numpy as np
+from PIL import Image, ImageFilter, ImageCms, ImageOps
+
+from collections import deque, Counter
 import skimage
+from scipy.ndimage import binary_fill_holes
 
 DIAGNOSTICS = False
+
+## mask stuff
+def outline_mask_by_dominant_color(
+    img: Image.Image,
+    tolerance: float = 10.0,
+    include_internal_outline: bool = False,
+) -> (Image.Image, Image.Image):
+    """
+    1. Opens an RGBA image from 'input_path'.
+    2. Scans for candidate outline pixels:
+       - Pixel alpha != 0
+       - At least one 8-way neighbor with alpha=0 or out of bounds (assume out of bounds=transparent)
+    3. Groups candidate pixels into color clusters (within 'tolerance' in RGB space).
+    4. Identifies the cluster with the highest count => 'dominant outline color'.
+    5. Builds a mask image:
+       - A pixel is ON (255) if it meets the candidate condition
+         and is within tolerance of the dominant color.
+       - Otherwise OFF (0).
+    6. Saves the resulting mask to 'output_path' as a PNG.
+    """
+    # Ensure we don't lose alpha info
+    if img.mode != "RGBA":
+        img = img.convert("RGBA")
+
+    # --- Helper functions ---
+    def color_distance_sq(c1, c2):
+        # Euclidean distance squared in RGB (ignore alpha)
+        return ((int(c1[0]) - int(c2[0])) ** 2 +
+                (int(c1[1]) - int(c2[1])) ** 2 +
+                (int(c1[2]) - int(c2[2])) ** 2)
+
+    def find_cluster_index(clusters, color, max_dist_sq):
+        """
+        Looks through 'clusters' for a representative color
+        whose distance to 'color' is <= max_dist_sq.
+        Returns index if found, else -1.
+        """
+        for i, (rep_color, count) in enumerate(clusters):
+            if color_distance_sq(rep_color, color) <= max_dist_sq:
+                return i
+        return -1
+
+    # --- 1) Open image in RGBA and build a NumPy array ---
+    arr = np.array(img)
+    h, w, _ = arr.shape
+
+    # Directions for an 8-way neighborhood
+    neighbors_8 = [(-1, -1), (-1, 0), (-1, 1),
+                   ( 0, -1),           ( 0, 1),
+                   ( 1, -1), ( 1, 0), ( 1, 1)]
+
+    # We consider a pixel "transparent" if alpha==0, or if it's out of bounds.
+
+    # --- 2) Identify candidate pixels and record their colors ---
+    clusters = []  # Will hold (representative_rgb, count)
+    max_dist_sq = tolerance * tolerance
+
+    for y in range(h):
+        for x in range(w):
+            a = arr[y, x, 3]
+            if a != 0:
+                # Check 8 neighbors => if any is out-of-bounds or alpha=0 => "transparent neighbor"
+                transparent_neighbor = False
+                for dy, dx in neighbors_8:
+                    ny = y + dy
+                    nx = x + dx
+                    # If it's out of bounds, treat as alpha=0 => transparent
+                    if ny < 0 or ny >= h or nx < 0 or nx >= w:
+                        transparent_neighbor = True
+                        break
+                    else:
+                        if arr[ny, nx, 3] == 0:
+                            transparent_neighbor = True
+                            break
+
+                if transparent_neighbor:
+                    # This pixel is a candidate outline pixel
+                    c = (arr[y, x, 0], arr[y, x, 1], arr[y, x, 2])  # (R, G, B)
+                    idx = find_cluster_index(clusters, c, max_dist_sq)
+                    if idx >= 0:
+                        rep_color, count = clusters[idx]
+                        clusters[idx] = (rep_color, count + 1)
+                    else:
+                        clusters.append((c, 1))
+
+    if not clusters:
+        # No outline pixels found; make a blank mask
+        mask_arr = np.zeros((h, w, 4), dtype=np.uint8)
+        return Image.fromarray(mask_arr, mode="RGBA"), img.copy()
+
+    # --- 3) Determine the dominant color cluster ---
+    # The cluster with the largest 'count'
+    dominant_cluster = max(clusters, key=lambda c: c[1])
+    dominant_color = dominant_cluster[0]  # (R, G, B)
+
+    # --- 4) Build the mask ---
+    mask_arr = np.zeros((h, w, 4), dtype=np.uint8)
+
+    for y in range(h):
+        for x in range(w):
+            a = arr[y, x, 3]
+            if a != 0:
+                # Check neighbors => if any is out-of-bounds or alpha=0
+                has_transparent_neighbor = False
+                for dy, dx in neighbors_8:
+                    ny = y + dy
+                    nx = x + dx
+                    if ny < 0 or ny >= h or nx < 0 or nx >= w:
+                        has_transparent_neighbor = True
+                        break
+                    else:
+                        if arr[ny, nx, 3] == 0:
+                            has_transparent_neighbor = True
+                            break
+
+                if has_transparent_neighbor:
+                    # See if pixel color is within tolerance of dominant_color
+                    this_rgb = arr[y, x, :3]
+                    if color_distance_sq(this_rgb, dominant_color) <= max_dist_sq:
+                        mask_arr[y, x] = arr[y, x]  # Outline pixel
+
+    external_mask_arr = mask_arr.copy()
+
+    # include internal outline if necessary.
+    if include_internal_outline:
+        # We'll do a BFS or DFS over all outline pixels in mask_arr
+        from collections import deque
+        queue = deque()
+
+        # Enqueue all existing outline pixels initially
+        for y in range(h):
+            for x in range(w):
+                if mask_arr[y, x, 3] != 0:
+                    queue.append((x, y))
+
+        # BFS
+        while queue:
+            x, y = queue.popleft()
+            # Explore neighbors
+            for dx, dy in neighbors_8:
+                nx, ny = x + dx, y + dy
+                if 0 <= nx < w and 0 <= ny < h:
+                    # Check if not already in outline mask
+                    if mask_arr[ny, nx, 3] == 0:
+                        alpha = arr[ny, nx, 3]
+                        if alpha != 0:
+                            # Within the same 'dominant' color tolerance?
+                            rgb = arr[ny, nx, :3]
+                            if color_distance_sq(rgb, dominant_color) <= max_dist_sq:
+                                # Mark as outline and enqueue
+                                mask_arr[ny, nx] = arr[ny, nx]
+                                queue.append((nx, ny))
+
+    # --- 5) Save the resulting mask ---
+    mask_img = Image.fromarray(mask_arr, mode="RGBA")
+    interior_img = fill_outline_with_interior(mask_arr, img, action='fill')
+    interior_img = fill_outline_with_interior(external_mask_arr, interior_img, action='blank')
+    return mask_img, interior_img
+
+def fill_outline_with_interior(
+    mask_arr: np.ndarray,
+    original_img: Image.Image,
+    max_search_radius: int = 3,
+    action: str = "fill",
+) -> Image.Image:
+    """
+    1) Converts 'original_img' to a NumPy RGBA array.
+    2) For every pixel where 'mask_arr[y, x, 3] != 0' (considered outline),
+       searches an expanding neighborhood (up to 'max_search_radius')
+       for interior pixels (mask_arr[y, x, 3] == 0).
+         - If action='fill':
+             * Gathers interior pixel colors and picks the majority color.
+             * If no interior color is found, leaves it as-is (or optionally transparent).
+           If action='blank':
+             * Sets that pixel to fully transparent immediately (0,0,0,0).
+    3) Returns a new RGBA Pillow Image with the updated pixels.
+    """
+
+    # Convert the original to RGBA and NumPy
+    orig_arr = np.array(original_img.convert("RGBA"))
+    h, w, _ = orig_arr.shape
+
+    # This will hold our final result
+    new_arr = orig_arr.copy()
+
+    # 8-way directions for local neighborhood checks
+    neighbors_8 = [
+        (-1, -1), (-1, 0), (-1, 1),
+        ( 0, -1),          ( 0, 1),
+        ( 1, -1), ( 1, 0), ( 1, 1)
+    ]
+
+    def gather_interior_colors(cx, cy, radius):
+        """
+        Returns a list of RGBA colors from 'orig_arr' for interior pixels within 'radius'
+        of (cx, cy). 'mask_arr' alpha=0 => interior pixel, alpha!=0 => outline pixel.
+        """
+        gathered = []
+        for dy in range(-radius, radius+1):
+            for dx in range(-radius, radius+1):
+                nx, ny = cx + dx, cy + dy
+                if 0 <= nx < w and 0 <= ny < h:
+                    # Check if neighbor is 'interior'
+                    if mask_arr[ny, nx, 3] == 0 and orig_arr[ny, nx, 3] != 0:
+                        gathered.append(tuple(orig_arr[ny, nx]))  # (R,G,B,A)
+        return gathered
+
+    for y in range(h):
+        for x in range(w):
+            # Check if this is an outline pixel
+            if mask_arr[y, x, 3] != 0:
+                if action == "blank":
+                    # Immediately set this outline pixel to transparent
+                    new_arr[y, x] = [0, 0, 0, 0]
+                else:
+                    # action=='fill' (default behavior)
+                    found_colors = []
+                    for radius in range(1, max_search_radius + 1):
+                        found_colors = gather_interior_colors(x, y, radius)
+                        if found_colors:
+                            break
+
+                    if found_colors:
+                        # Pick the majority color among found_colors
+                        color_counts = Counter(found_colors)
+                        likely_color, _ = color_counts.most_common(1)[0]
+                        new_arr[y, x] = likely_color
+                    else:
+                        # No interior neighbor found. Optionally make transparent:
+                        # new_arr[y, x] = [0, 0, 0, 0]
+                        pass
+
+    return Image.fromarray(new_arr, mode="RGBA")
+
+
+def downscale_outline_components(
+        outline_mask: Image.Image,
+        scale: int,
+        fill_threshold: float = 0.5
+) -> Image.Image:
+    """
+    Approach A: Connected-component-aware downscale of an outline mask.
+
+    1) Convert the input outline mask to a binary array (1=on/outline, 0=off).
+    2) Label connected components (8-way).
+    3) For each component, extract its bounding box.
+    4) Downscale that bounding box from old_size to new_size by block-sampling:
+       If fraction of original 'on' pixels mapping to a new pixel >= fill_threshold,
+       mark the new pixel as 'on'.
+    5) Place each downscaled bounding box into a final (new_width x new_height) mask.
+    6) Return an RGBA image where alpha=255 => outline, alpha=0 => background.
+
+    Args:
+        outline_mask:  Pillow Image in RGBA or L mode. Non-zero => on/outline, zero => off.
+        scale: Scale factor.
+        fill_threshold:
+            A float in [0..1]. The fraction of "on" pixels needed in a block
+            to call the downscaled pixel 'on'.
+            - 0.5 => if at least half are on, new pixel becomes on.
+
+    Returns:
+        An RGBA Pillow Image of size (new_width, new_height).
+        Pixel alpha=255 => outline, alpha=0 => background.
+    """
+
+    # --- 1) Convert to binary array ---
+    arr = np.array(outline_mask.convert("RGBA"))
+    # We'll treat alpha>0 as 'on'. If you prefer an L-mode mask, adjust accordingly.
+    bin_arr = (arr[:, :, 3] > 0).astype(np.uint8)
+    orig_h, orig_w = bin_arr.shape
+    new_width = orig_w // scale
+    new_height = orig_h // scale
+    # The output array in binary form (1=on, 0=off). We'll fill it component by component.
+    final_bin = np.zeros((new_height, new_width), dtype=np.uint8)
+
+    # 8-way connectivity for BFS/DFS
+    neighbors_8 = [(-1, -1), (-1, 0), (-1, 1),
+                   (0, -1), (0, 1),
+                   (1, -1), (1, 0), (1, 1)]
+
+    # --- 2) Label connected components (8-way) ---
+    # We'll do a manual BFS labeling approach (no external libraries).
+    label_map = np.zeros_like(bin_arr, dtype=np.int32)  # 0 => unlabeled
+    label_counter = 0
+
+    for y in range(orig_h):
+        for x in range(orig_w):
+            if bin_arr[y, x] == 1 and label_map[y, x] == 0:
+                # Found a new connected component
+                label_counter += 1
+                # BFS from (x, y)
+                queue = deque()
+                queue.append((x, y))
+                label_map[y, x] = label_counter
+
+                while queue:
+                    cx, cy = queue.popleft()
+                    for dx, dy in neighbors_8:
+                        nx, ny = cx + dx, cy + dy
+                        if 0 <= nx < orig_w and 0 <= ny < orig_h:
+                            if bin_arr[ny, nx] == 1 and label_map[ny, nx] == 0:
+                                label_map[ny, nx] = label_counter
+                                queue.append((nx, ny))
+
+
+    if label_counter == 0:
+        # No outline pixels => return blank mask
+        return Image.new("RGBA", (new_width, new_height), (0, 0, 0, 0))
+
+    # --- 3) For each component, find bounding box ---
+    # We'll store (xmin, ymin, xmax, ymax) for each label
+    boxes = [(orig_w, orig_h, -1, -1)] * (label_counter + 1)  # index 0 is unused
+    # Initialize: (xmin, ymin, xmax, ymax) => we'll track min max
+
+    # Overwrite with valid min/max
+    boxes = []
+    for _ in range(label_counter + 1):
+        boxes.append([orig_w, orig_h, -1, -1])  # [xmin, ymin, xmax, ymax]
+
+    for y in range(orig_h):
+        for x in range(orig_w):
+            lab = label_map[y, x]
+            if lab != 0:
+                if x < boxes[lab][0]:
+                    boxes[lab][0] = x
+                if y < boxes[lab][1]:
+                    boxes[lab][1] = y
+                if x > boxes[lab][2]:
+                    boxes[lab][2] = x
+                if y > boxes[lab][3]:
+                    boxes[lab][3] = y
+
+    # --- 4) Downscale each bounding box and composite into final_bin ---
+    # We'll define a helper function to handle block sampling for a single bounding box.
+
+    def downscale_component_block(lab_id, xmin, ymin, xmax, ymax):
+        """
+        Extracts the component's bounding box from label_map==lab_id,
+        downscales it to the fraction that fits new_width/new_height
+        according to a global scale, or a separate bounding-box-based scale approach.
+
+        We'll do a global scale based on:
+          scale_x = new_width / orig_w
+          scale_y = new_height / orig_h
+        Then place it in final_bin at the appropriate location.
+        Alternatively, you can choose bounding-box-based scaling separately,
+        but that can complicate alignment with the interior.
+        """
+        # bounding box size
+        w_box = (xmax - xmin + 1)
+        h_box = (ymax - ymin + 1)
+
+        # Determine global scale factors (like if you're consistently scaling entire sprite)
+        scale_x = new_width / orig_w
+        scale_y = new_height / orig_h
+
+        # new bounding box sizes (round or floor)
+        new_w_box = max(1, int(round(w_box * scale_x)))
+        new_h_box = max(1, int(round(h_box * scale_y)))
+
+        # We'll create a small 2D array new_box_bin to store the downscaled bounding box
+        new_box_bin = np.zeros((new_h_box, new_w_box), dtype=np.uint8)
+
+        # Each new pixel corresponds to a block of size (scale_factor_x * scale_factor_y)
+        # Let's invert that logic:
+        # For each new pixel (nx, ny), find which block in the original bounding box it maps to.
+        # Then count how many are on. If fraction >= fill_threshold => on.
+
+        for ny in range(new_h_box):
+            for nx in range(new_w_box):
+                # original block in [xmin, xmax], [ymin, ymax]
+                # We'll do a float-based approach to compute the region in the original bounding box
+                # that maps to (nx, ny) in new_box_bin.
+                # For example: x0 = (nx / new_w_box) * w_box, x1 = ((nx+1) / new_w_box) * w_box
+                # Then we offset by xmin in the global array.
+
+                x0 = int(xmin + (nx / new_w_box) * w_box)
+                x1 = int(xmin + ((nx + 1) / new_w_box) * w_box)  # not inclusive
+                y0 = int(ymin + (ny / new_h_box) * h_box)
+                y1 = int(ymin + ((ny + 1) / new_h_box) * h_box)
+
+                if x1 > x0 and y1 > y0:
+                    block = (label_map[y0:y1, x0:x1] == lab_id)
+                    # fraction of on-pixels
+                    fraction_on = block.sum() / block.size
+                    if fraction_on >= fill_threshold:
+                        new_box_bin[ny, nx] = 1
+
+        # Now we place new_box_bin in the final_bin with the correct offset
+        # We'll compute the scaled bounding box coords in final_bin
+        scaled_xmin = int(round(xmin * scale_x))
+        scaled_ymin = int(round(ymin * scale_y))
+
+        # Then overlay new_box_bin
+        for ny in range(new_h_box):
+            for nx in range(new_w_box):
+                if new_box_bin[ny, nx] == 1:
+                    fy = scaled_ymin + ny
+                    fx = scaled_xmin + nx
+                    if 0 <= fx < new_width and 0 <= fy < new_height:
+                        final_bin[fy, fx] = 1
+
+    # Loop over each component
+    for lab_id in range(1, label_counter + 1):
+        xmin, ymin, xmax, ymax = boxes[lab_id]
+        if xmin <= xmax and ymin <= ymax:
+            downscale_component_block(lab_id, xmin, ymin, xmax, ymax)
+
+    # Build RGBA from final_bin
+    # alpha=255 => outline, 0 => background
+    final_rgba = np.zeros((new_height, new_width, 4), dtype=np.uint8)
+    final_rgba[final_bin == 1, 3] = 255
+
+    return Image.fromarray(final_rgba, mode="RGBA")
+
+
+def xor_alpha_masks(mask1: Image.Image, mask2: Image.Image) -> Image.Image:
+    """
+    Takes two RGBA images 'mask1' and 'mask2', each serving as a mask:
+      - A pixel is considered "set" if its alpha channel > 0.
+    Returns a new RGBA image 'xor_mask', where:
+      - xor_mask alpha=255 if exactly one of (mask1, mask2) has alpha>0 at that pixel.
+      - Otherwise alpha=0.
+    All RGB channels are set to 0 in the resulting mask (only alpha is used).
+    """
+
+    # Convert both masks to RGBA arrays
+    arr1 = np.array(mask1.convert("RGBA"))
+    arr2 = np.array(mask2.convert("RGBA"))
+
+    # Ensure both have the same dimensions
+    if arr1.shape != arr2.shape:
+        raise ValueError(f"Mask dimensions differ: {arr1.shape} vs {arr2.shape}")
+
+    h, w, _ = arr1.shape
+
+    # Determine which pixels are set (alpha>0)
+    set1 = (arr1[..., 3] > 0)
+    set2 = (arr2[..., 3] > 0)
+
+    # Compute XOR: True if exactly one mask is set, False otherwise
+    out_set = np.logical_xor(set1, set2)
+
+    # Build an output RGBA array: everything black, alpha=255 where out_set is True
+    out_rgba = np.zeros((h, w, 4), dtype=np.uint8)
+    out_rgba[out_set, 3] = 255
+
+    # Convert back to a Pillow Image
+    return Image.fromarray(out_rgba, mode="RGBA")
+
+def postprocess_thick_outline(
+        downscaled_img: Image.Image,
+        internal_colors: Image.Image,
+        max_search_radius: int = 3
+) -> Image.Image:
+    """
+    Post-process a downscaled image to thin out any overly thick outlines.
+
+    Steps:
+      1) Convert 'downscaled_img' (the final, smaller sprite) to an RGBA array.
+      2) For each pixel where alpha>0, check if all 8-way neighbors also have alpha>0
+         => It's an "internal" outline pixel (thicker than 1px).
+      3) Replace that pixel with a guessed interior color from 'original_upscaled' by
+         sampling around (x*scale_factor, y*scale_factor) within max_search_radius.
+         - If no interior color found, optionally leave it or make it transparent.
+      4) Return a new RGBA Pillow Image.
+
+    Args:
+        downscaled_img:       The final, downscaled RGBA sprite.
+        internal_colors:      The 'de-outlined' interior color image.
+        max_search_radius:    Neighborhood in 'internal_colors' to look for interior colors.
+
+    Returns:
+        A Pillow Image in RGBA mode, with thick, interior outline pixels replaced by interior colors.
+    """
+
+    # Convert the final downscaled image to RGBA array
+    final_arr = np.array(downscaled_img.convert("RGBA"))
+    h, w, _ = final_arr.shape
+
+    # Convert the internal color img for color referencing
+    orig_arr = np.array(internal_colors.convert("RGBA"))
+    H, W, _ = orig_arr.shape
+
+    # 8-way neighbors
+    neighbors_8 = [
+        (-1, -1), (-1, 0), (-1, 1),
+        (0, -1), (0, 1),
+        (1, -1), (1, 0), (1, 1)
+    ]
+
+    def is_thick_outline(x, y):
+        """
+        True if final_arr[y, x] has alpha>0 AND
+        all 8 neighbors are also alpha>0 => no transparency around => internal outline pixel.
+        """
+        if final_arr[y, x, 3] == 0:
+            return False
+
+        for dx, dy in neighbors_8:
+            nx, ny = x + dx, y + dy
+            if 0 <= nx < w and 0 <= ny < h:
+                if final_arr[ny, nx, 3] == 0:
+                    return False
+            else:
+                # If out-of-bounds, treat as transparent (so the edge won't be considered thick)
+                return False
+        return True
+
+    def gather_interior_colors(up_x, up_y, radius):
+        """
+        Gathers colors from 'orig_arr' in a (2*radius+1)x(2*radius+1) region centered at (up_x, up_y).
+        We'll consider any pixel with alpha=255 as "interior."
+        """
+        gathered = []
+        for dy in range(-radius, radius + 1):
+            for dx in range(-radius, radius + 1):
+                nx, ny = up_x + dx, up_y + dy
+                if 0 <= nx < W and 0 <= ny < H:
+                    if orig_arr[ny, nx, 3] == 255:  # fully opaque => likely interior
+                        gathered.append(tuple(orig_arr[ny, nx]))  # (R,G,B,A)
+        return gathered
+
+    result_arr = final_arr.copy()
+
+    for y in range(h):
+        for x in range(w):
+            if is_thick_outline(x, y):
+                # This is an interior portion of a thick outline
+                # => Attempt to fill with an interior color from original_upscaled
+                found_colors = []
+                for r in range(1, max_search_radius + 1):
+                    found_colors = gather_interior_colors(x, y, r)
+                    if found_colors:
+                        break
+
+                if found_colors:
+                    color_counts = Counter(found_colors)
+                    likely_color, _ = color_counts.most_common(1)[0]
+                    result_arr[y, x] = likely_color
+                else:
+                    # If no color found, do nothing or make transparent:
+                    # result_arr[y, x] = [0,0,0,0]
+                    pass
+
+    return Image.fromarray(result_arr, mode="RGBA")
+
+def remove_l_corners(mask_img: Image.Image) -> Image.Image:
+    """
+    Scans a binary outline mask and removes 'L corners' in 2x2 blocks.
+    Specifically, if a 2x2 block has exactly three 'on' pixels (forming an L shape),
+    we remove (turn off) the corner pixel to leave a diagonal of two 'on' pixels.
+
+    mask_img : A Pillow Image where 'on' pixels have alpha>0, or are otherwise nonzero.
+
+    Returns : A new Pillow Image in RGBA where corner pixels are removed.
+    """
+
+    # Convert to RGBA to ensure alpha channel, then to a NumPy array
+    rgba_arr = np.array(mask_img.convert("RGBA"))
+    h, w, _ = rgba_arr.shape
+
+    # Build a simple binary mask: 1=on if alpha>0, else 0
+    in_mask = (rgba_arr[..., 3] > 0).astype(np.uint8)
+
+    # We'll store results in out_mask
+    out_mask = in_mask.copy()
+
+    # Define the 2x2 block patterns and how to transform them
+    # Key: (A,B,C,D) => Value: (A',B',C',D')
+    # A=top-left, B=top-right, C=bottom-left, D=bottom-right
+    # Each tuple is 0/1 for 'off'/'on'.
+    # These 4 patterns represent the 3-on-1-off 'L shapes' in all orientations,
+    # and we convert them to a 2-on diagonal.
+    pattern_map = {
+        (1, 1, 1, 0): (0, 1, 1, 0),  # remove top-left corner -> diagonal top-right to bottom-left
+        (1, 1, 0, 1): (1, 0, 0, 1),  # remove top-right corner -> diagonal top-left to bottom-right
+        (1, 0, 1, 1): (1, 0, 0, 1),  # remove bottom-left corner -> diagonal top-left to bottom-right
+        (0, 1, 1, 1): (0, 1, 1, 0),  # remove bottom-right corner -> diagonal top-right to bottom-left
+    }
+
+    # Traverse every 2x2 block
+    # We'll write changes to out_mask so the pass is consistent
+    for y in range(h - 1):
+        for x in range(w - 1):
+            A = in_mask[y, x]
+            B = in_mask[y, x + 1]
+            C = in_mask[y + 1, x]
+            D = in_mask[y + 1, x + 1]
+            block = (A, B, C, D)
+
+            if block in pattern_map:
+                new_block = pattern_map[block]
+                # Update out_mask
+                out_mask[y, x] = new_block[0]
+                out_mask[y, x + 1] = new_block[1]
+                out_mask[y + 1, x] = new_block[2]
+                out_mask[y + 1, x + 1] = new_block[3]
+            else:
+                # Otherwise, keep it as-is
+                pass
+
+    # Convert out_mask back into RGBA
+    # alpha=255 if 'on', else 0, and R=G=B=0
+    result_rgba = np.zeros((h, w, 4), dtype=np.uint8)
+    result_rgba[out_mask == 1, 3] = 255  # set alpha=255 for on pixels
+
+    return Image.fromarray(result_rgba, mode="RGBA")
+
+def set_interior_pixels(
+    mask_img: Image.Image,
+    fill_color: tuple = (0, 0, 0, 255)
+) -> Image.Image:
+    """
+    Sets all pixels inside the mask outline to a specified fill color.
+
+    Args:
+        mask_img (PIL.Image.Image): The mask image in RGBA mode where the outline has alpha > 0.
+        fill_color (tuple): The RGBA color to set for interior pixels. Default is (0, 0, 0, 255).
+        output_img_path (str, optional): Path to save the output image. If None, the image is not saved.
+
+    Returns:
+        PIL.Image.Image: The modified image with interiors filled.
+    """
+
+    # Ensure the mask is in RGBA mode
+    mask_rgba = mask_img.convert("RGBA")
+
+    # Convert the mask image to a NumPy array
+    mask_arr = np.array(mask_rgba)
+    h, w, _ = mask_arr.shape
+
+    # Create a binary mask: 1 for outline pixels (alpha > 0), 0 otherwise
+    binary_mask = (mask_arr[..., 3] > 0).astype(np.uint8)
+
+    # Use binary_fill_holes to identify interior regions
+    # binary_fill_holes fills enclosed areas (interior) but leaves the outline intact
+    filled_mask = binary_fill_holes(binary_mask).astype(np.uint8)
+
+    # The interior is where filled_mask is 1 and binary_mask is 0
+    interior_mask = filled_mask - binary_mask
+
+    # Create a copy of the original mask to modify
+    result_arr = mask_arr.copy()
+
+    # Set interior pixels to the specified fill color
+    result_arr[interior_mask == 1] = fill_color
+
+    # Convert the NumPy array back to a Pillow Image
+    result_img = Image.fromarray(result_arr, mode="RGBA")
+    return result_img
+
 
 def ensure_srgb(pil_img: Image.Image) -> Image.Image:
     """
@@ -238,14 +892,14 @@ def conditional_replace(
     # 4) Convert both images to NumPy arrays
     down_arr = np.array(downsampled_original_img)  # shape: (h, w, 4)
     second_arr = np.array(second_img) # shape: (h, w, 4)
-    mask_arr = np.array(mask)
+    mask_arr = np.array(mask) if mask is not None else None
     # 5) Create a final array starting as a copy of the second image
     final_arr = second_arr.copy()
 
     # 6) For each pixel, conditionally replace
     for y in range(h):
         for x in range(w):
-            m = mask_arr[y, x]
+            m = mask_arr[y, x] if mask_arr is not None else 1
             if m == 0:
                 final_arr[y, x] = [0, 0, 0, 0]
                 continue
@@ -387,6 +1041,10 @@ def blend_edges_second_pass(img, edge_threshold=30, alpha=0.5):
     original_alpha = img.split()[-1]
     return Image.merge("RGBA", (combined, combined, combined, original_alpha))
 
+def paste_img(dest, src) -> Image.Image:
+    new_layer = Image.new("RGBA", dest.size)
+    new_layer.paste(src, (0, 0))
+    return Image.alpha_composite(dest, new_layer)
 
 def main():
     parser = argparse.ArgumentParser(description="Pixel Art Downscaling with RGBA & Small-Sprite Optimizations")
@@ -394,7 +1052,7 @@ def main():
     parser.add_argument("output", help="Path to output image")
     parser.add_argument("-s", "--scale_factor", type=int, default=2,
                         help="Reduction ratio (default=2 => half width & height).")
-    parser.add_argument("-o", "--operations", type=str, default="1,2,3",
+    parser.add_argument("-o", "--operations", type=str, default="1,2",
                         help="Comma-separated list of operations in order:"
                              " 1=Majority-Color Downscale,"
                              " 2=Refined Edge-Preserving")
@@ -407,6 +1065,9 @@ def main():
                         help="Use soft edges for Refined Edge-Preserving.")
     parser.add_argument("--alpha_min", type=int, default=72,
                         help="Alpha Threshold for inclusion in output (default=72).")
+    parser.add_argument("--process_outline", type=str, default=None,
+                        help="Process sprite outline. (preserve/remove)")
+
     args = parser.parse_args()
 
     # Load original image in RGBA
@@ -415,15 +1076,53 @@ def main():
     # Parse operations
     ops = [op.strip() for op in args.operations.split(",")]
 
-    downsampled_img = (original_img.resize(
-        (original_img.width//args.scale_factor, original_img.height//args.scale_factor),
-        Image.Resampling.LANCZOS)
-                       .convert("RGBA"))
+    downsampled_img = naive_downsample(original_img, args.scale_factor)
+
+    external_outline_mask = None
+    internal_outline_mask = None
+    interior_img = None
+    if args.process_outline is not None:
+        external_outline_mask, _ = outline_mask_by_dominant_color(original_img, include_internal_outline=False, tolerance=0)
+        internal_outline_mask, interior_img = outline_mask_by_dominant_color(original_img,
+                                                                             include_internal_outline=True)
+
+        # save 'de-outlined' image as original image and naive downsampled version.
+        original_img = interior_img
+        downsampled_img = naive_downsample(original_img, args.scale_factor,
+                                           method=Image.Resampling.BILINEAR,
+                                           remove_alpha=True)
+
+        # # downscale_outline_components
+        fill_threshold = args.scale_factor / 8
+        external_outline_mask = downscale_outline_components(
+            outline_mask=external_outline_mask,
+            scale=args.scale_factor,
+            fill_threshold=fill_threshold)
+        # external_outline_mask = remove_l_corners(external_outline_mask)
+        ff_mask = build_outline_aware_mask(external_outline_mask)
+
+    else:
+        ff_mask = floodfill_mask(downsampled_img)
 
     if DIAGNOSTICS:
         downsampled_img.save('downsampled_' + args.output)
 
-    # Intermediate result
+        if internal_outline_mask:
+            internal_outline_mask.save('internal_outline_mask' + args.output)
+            internal_outline_mask = downscale_outline_components(
+                outline_mask=internal_outline_mask,
+                scale=args.scale_factor,
+                fill_threshold=fill_threshold)
+            internal_outline_mask.save('internal_outline_mask_sm_' + args.output)
+        if interior_img:
+            interior_img.save('interior_' + args.output)
+
+        if external_outline_mask:
+            external_outline_mask.save('external_outline_mask_sm_' + args.output)
+        downsampled_img.save('downsampled_' + args.output)
+        ff_mask.save('ff_mask_' + args.output)
+
+    # perform requested operations
     result_img = original_img
     for op in ops:
         if op == "1":
@@ -448,13 +1147,15 @@ def main():
             print(f"Unknown operation: {op}")
             sys.exit(1)
 
-    mask = floodfill_mask(downsampled_img)
-
     if DIAGNOSTICS:
-        mask.save('mask_' + args.output)
         result_img.save('pre_conditional_replace_' + args.output)
 
-    result_img = conditional_replace(downsampled_img, result_img, mask, args.alpha_min)
+    result_img = conditional_replace(downsampled_img, result_img, ff_mask, args.alpha_min)
+    if args.process_outline == "preserve":
+        # we processed the outline separately
+        result_img = paste_img(result_img, external_outline_mask)
+    # result_img.save('with_outline_'+ args.output)
+    # result_img = postprocess_thick_outline(result_img, interior_img, original_scale_factor)
 
     # match to palette
     if args.palette:
@@ -465,8 +1166,43 @@ def main():
     result_img.save(args.output)
 
 
+def naive_downsample(original_img, scale_factor, method=Image.Resampling.LANCZOS, remove_alpha=False):
+    d_img = (original_img.resize(
+        (original_img.width // scale_factor, original_img.height // scale_factor),
+        method).convert("RGBA"))
+    if remove_alpha:
+        d_arr = np.array(d_img)
+        h, w, _ = d_arr.shape
+        for y in range(h):
+            for x in range(w):
+                a = d_arr[y, x, 3]
+                if a > 0:
+                    d_arr[y, x, 3] = 255
+        d_img = Image.fromarray(d_arr).convert("RGBA")
+    return d_img
+
+
+def build_outline_aware_mask(external_outline_mask):
+    ff_mask = set_interior_pixels(external_outline_mask, (0, 0, 0, 255))
+    ff_arr = np.array(ff_mask.convert("RGBA"))
+    h, w, _ = ff_arr.shape
+    for y in range(h):
+        for x in range(w):
+            a = ff_arr[y, x, 3]
+            if a == 0:
+                ff_arr[y, x] = [255, 255, 255, 255]
+    ff_mask = Image.fromarray(ff_arr, mode="RGBA").convert("L")
+    ff_mask = ImageOps.invert(ff_mask)
+    return ff_mask
+
+
+##
+
+
 if __name__ == "__main__":
     main()
+
+
 
 # for character artwork:
     # python pix.py <input>.png <output>.png -o 1 -s 2
