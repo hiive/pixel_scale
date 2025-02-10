@@ -5,10 +5,10 @@ It attempts to preserve relevant details on downscaling.
 Suggested command lines:
 
 For tiles/large features.
-- `python pix.py <input>.png <output>.png -o 1,2 -s 2` 
+- `uv run pix.py <input>.png <output>.png -o 1,2 -s 2` 
 
 For characters/fine details/lots of transparency:
-- `python pix.py <input>.png <output>.png -o 2 -s 2` 
+- `uv run pix.py <input>.png <output>.png -o 2 -s 2` 
 
 Running the command without parameters will provide help, 
 of a sort, and I'll be filling in this readme as I refine things further.
