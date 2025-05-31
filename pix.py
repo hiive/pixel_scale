@@ -673,7 +673,7 @@ def ensure_srgb(pil_img: Image.Image) -> Image.Image:
     """
     # If there's an embedded ICC profile, we can extract it:
     icc_profile = pil_img.info.get("icc_profile", None)
-    if icc_profile:
+    if (icc_profile):
         # Convert from embedded profile to sRGB
         input_profile = io.BytesIO(icc_profile)  # the embedded profile
         srgb_profile = ImageCms.createProfile("sRGB")  # sRGB profile
@@ -926,6 +926,8 @@ def majority_color_block_sampling(img, scale_factor):
       the function preserves that transparency.
     """
     # Ensure we don't lose alpha info
+    if scale_factor < 1:
+        raise ValueError("scale_factor must be >= 1")
     if img.mode != "RGBA":
         img = img.convert("RGBA")
 
@@ -964,12 +966,12 @@ def majority_color_block_sampling(img, scale_factor):
                 else:
                     color_counts = {}
                     for row in opaque_pixels:
-                        color_tuple = tuple(row)
+                        color_tuple = tuple(int(v) for v in row)
                         color_counts[color_tuple] = color_counts.get(color_tuple, 0) + 1
 
-                        # simple majority
-                        majority_color = max(color_counts, key=color_counts.get)
-                        output[y, x] = majority_color
+                    # simple majority
+                    majority_color = max(color_counts, key=color_counts.get)
+                    output[y, x] = majority_color
 
     return Image.fromarray(output, mode="RGBA")
 
@@ -1000,7 +1002,7 @@ def refined_edge_preserving_downscale(img, scale_factor, soft_edges, edge_thresh
     # Step 3a: Add partial opacity to the mask so it doesn't produce pure black
     # We'll do this by converting edges to RGBA and adjusting alpha.
     mask_rgba = Image.new("RGBA", color_data.size)
-    if soft_edges:
+    if (soft_edges):
         mask_rgba.putdata([(0, 0, 0, v) for v in strong_edges.getdata()])
     else:
         mask_rgba.putdata([(0, 0, 0, 255 if v > 0 else 0) for v in strong_edges.getdata()])
@@ -1046,37 +1048,53 @@ def paste_img(dest, src) -> Image.Image:
     new_layer.paste(src, (0, 0))
     return Image.alpha_composite(dest, new_layer)
 
-def main():
-    parser = argparse.ArgumentParser(description="Pixel Art Downscaling with RGBA & Small-Sprite Optimizations")
-    parser.add_argument("input", help="Path to input image")
-    parser.add_argument("output", help="Path to output image")
-    parser.add_argument("-s", "--scale_factor", type=int, default=2,
-                        help="Reduction ratio (default=2 => half width & height).")
-    parser.add_argument("-o", "--operations", type=str, default="1,2",
-                        help="Comma-separated list of operations in order:"
-                             " 1=Majority-Color Downscale,"
-                             " 2=Refined Edge-Preserving")
-    parser.add_argument("--edge_threshold", type=int, default=30,
-                        help="Threshold for major edges (default=30).")
-    # parser.add_argument("--blend_alpha", type=float, default=1.0,
-    #                     help="Blending alpha for second-pass edges (default=0.0).")
-    parser.add_argument("--palette", type=str, default=None, help="Path to PNG to extract final palette from.")
-    parser.add_argument("--soft_edges", action="store_true",
-                        help="Use soft edges for Refined Edge-Preserving.")
-    parser.add_argument("--alpha_min", type=int, default=72,
-                        help="Alpha Threshold for inclusion in output (default=72).")
-    parser.add_argument("--process_outline", type=str, default=None,
-                        help="Process sprite outline. (preserve/remove)")
+def main(input_img=None, ds_factor=2, target_width=0, target_height=0, operations=None) -> Image.Image:
+    if input_img is None:
+        parser = argparse.ArgumentParser(description="Pixel Art Downscaling with RGBA & Small-Sprite Optimizations")
+        parser.add_argument("input", help="Path to input image")
+        parser.add_argument("output", help="Path to output image")
+        parser.add_argument("-s", "--scale_factor", type=int, default=2,
+                            help="Reduction ratio (default=2 => half width & height).")
+        parser.add_argument("-o", "--operations", type=str, default="1,2",
+                            help="Comma-separated list of operations in order:"
+                                 " 1=Majority-Color Downscale,"
+                                 " 2=Refined Edge-Preserving")
+        parser.add_argument("--edge_threshold", type=int, default=30,
+                            help="Threshold for major edges (default=30).")
+        # parser.add_argument("--blend_alpha", type=float, default=1.0,
+        #                     help="Blending alpha for second-pass edges (default=0.0).")
+        parser.add_argument("--palette", type=str, default=None, help="Path to PNG to extract final palette from.")
+        parser.add_argument("--soft_edges", action="store_true",
+                            help="Use soft edges for Refined Edge-Preserving.")
+        parser.add_argument("--alpha_min", type=int, default=72,
+                            help="Alpha Threshold for inclusion in output (default=72).")
+        parser.add_argument("--process_outline", type=str, default=None,
+                            help="Process sprite outline. (preserve/remove)")
 
-    args = parser.parse_args()
+        args = parser.parse_args()
 
-    # Load original image in RGBA
-    original_img = Image.open(args.input).convert("RGBA")
+        # Load original image in RGBA
+        original_img = Image.open(args.input).convert("RGBA")
 
-    # Parse operations
-    ops = [op.strip() for op in args.operations.split(",")]
-
-    downsampled_img = naive_downsample(original_img, args.scale_factor)
+        # Parse operations
+        ops = [op.strip() for op in args.operations.split(",")]
+        downsampled_img = naive_downsample(original_img, args.scale_factor)
+    else:
+        # When called from streamlit_main.py, use the provided image.
+        from argparse import Namespace
+        # Accept operations from argument if provided
+        if operations is not None:
+            ops = [op.strip() for op in operations.split(",")]
+        else:
+            ops = ["1", "2"]
+        args = Namespace(scale_factor=ds_factor, operations=operations or "1,2", edge_threshold=30, palette=None,
+                         soft_edges=False, alpha_min=72, process_outline=None, output="output.png")
+        original_img = input_img.convert("RGBA")
+        # Use target_width/target_height if provided; otherwise use ds_factor:
+        if target_width is not None and target_height is not None and target_width > 0 and target_height > 0:
+            downsampled_img = original_img.resize((target_width, target_height), Image.Resampling.LANCZOS).convert("RGBA")
+        else:
+            downsampled_img = naive_downsample(original_img, ds_factor)
 
     external_outline_mask = None
     internal_outline_mask = None
@@ -1164,6 +1182,7 @@ def main():
         result_img = enforce_palette_lab_bulk(result_img, palette_img)
     # Save result
     result_img.save(args.output)
+    return result_img
 
 
 def naive_downsample(original_img, scale_factor, method=Image.Resampling.LANCZOS, remove_alpha=False):

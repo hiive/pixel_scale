@@ -27,6 +27,18 @@ wheels = [
 ]
 
 [[package]]
+name = "pixelscale"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "numpy" },
+    { name = "pillow" },
+    { name = "scikit-image" },
+    { name = "streamlit" },
+    { name = "streamlit-image-comparison" },
+]
+
+[[package]]
 name = "networkx"
 version = "3.4.2"
 source = { registry = "https://pypi.org/simple" }
