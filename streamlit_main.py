@@ -48,10 +48,24 @@ def cache_majority_block(image_bytes, ds_factor) -> Image:
 
 def main():
     #Data Input options
-    st.title("Downscale + Method Comparison App")
+    
+    st.title("Adaptive Downscale + Method Comparison App")
+    st.markdown(
+        """
+        <div style='text-align: right; font-size: 0.9em; color: #888;'>
+            Developed by: 
+            <a href="https://github.com/hiive" target="_blank">Hiive</a> &amp; 
+            <a href="https://hiivelabs.com" target="_blank">Hiivelabs</a> &amp; 
+            <a href="https://github.com/siker102" target="_blank">Siker102</a>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
     uploaded_image = st.file_uploader("Upload an image", type=["png", "jpg", "jpeg"])
     ds_factor = st.radio("Downscale Factor (ds_factor)", options=[2, 4, 6, 8], index=0, horizontal=True)  # Fixed spacing
     algo = st.radio("Select algorithm:", options=["Pix", "YUV"], horizontal=True)
+
+    
     
     target_width = 0
     target_height = 0
