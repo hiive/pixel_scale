@@ -62,7 +62,7 @@ def main():
         unsafe_allow_html=True
     )
     uploaded_image = st.file_uploader("Upload an image", type=["png", "jpg", "jpeg"])
-    ds_factor = st.radio("Downscale Factor (ds_factor)", options=[2, 4, 6, 8], index=0, horizontal=True)  # Fixed spacing
+    ds_factor = st.slider("Downscale Factor (ds_factor)", min_value=2, max_value=8, value=2, step=1)
     algo = st.radio("Select algorithm:", options=["Pix", "YUV"], horizontal=True)
 
     
