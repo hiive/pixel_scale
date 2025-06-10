@@ -917,68 +917,88 @@ def conditional_replace(
     # 7) Convert the array back to an Image and return
     return Image.fromarray(final_arr, mode="RGBA")
 
-def majority_color_block_sampling(img, scale_factor):
+def majority_color_block_sampling(img, scale_factor, target_width=None, target_height=None):
     """
     Downscale using majority-color block sampling (RGBA-aware).
-    - 'scale_factor' indicates how many original pixels
-      combine into one new pixel (e.g., 2 => 2x2 -> 1x1).
-    - If the image is RGBA and alpha is either 0 or 255 (fully transparent or fully opaque),
-      the function preserves that transparency.
+    If target_width/target_height are provided, resize to that size using block sampling logic.
+    Otherwise, use scale_factor.
     """
-    # Ensure we don't lose alpha info
-    if scale_factor < 1:
-        raise ValueError("scale_factor must be >= 1")
     if img.mode != "RGBA":
         img = img.convert("RGBA")
 
     width, height = img.size
-    new_width, new_height = width // scale_factor, height // scale_factor
 
-    pixels = np.array(img)  # shape: (height, width, 4) for RGBA
-
-    # Create an output array for RGBA
-    output = np.zeros((new_height, new_width, 4), dtype=pixels.dtype)
-
-    for y in range(new_height):
-        for x in range(new_width):
-            # Identify the block in the original image
-            block = pixels[
-                y * scale_factor : (y + 1) * scale_factor,
-                x * scale_factor : (x + 1) * scale_factor
-            ]
-            # Flatten and handle each pixel’s RGBA
-            block_2d = block.reshape(-1, 4)
-
-            # Count transparency vs. opaque
-            alpha_values = block_2d[:, 3]
-            num_transparent = np.sum(alpha_values == 0)
-            num_opaque = len(alpha_values) - num_transparent
-
-            # If mostly transparent in this block => fully transparent pixel
-            if num_transparent > num_opaque:
-                output[y, x] = [0, 0, 0, 0]
-            else:
-                # Among the opaque pixels, find the most frequent RGBA
-                opaque_pixels = block_2d[block_2d[:, 3] != 0]
-                # If no opaque pixels exist, force transparent
-                if len(opaque_pixels) == 0:
+    # If target size is provided, compute scale_factor accordingly
+    if target_width is not None and target_height is not None and target_width > 0 and target_height > 0:
+        new_width, new_height = target_width, target_height
+        scale_x = width / new_width
+        scale_y = height / new_height
+        pixels = np.array(img)
+        output = np.zeros((new_height, new_width, 4), dtype=pixels.dtype)
+        for y in range(new_height):
+            for x in range(new_width):
+                # Compute the block in the original image
+                x0 = int(round(x * scale_x))
+                x1 = int(round((x + 1) * scale_x))
+                y0 = int(round(y * scale_y))
+                y1 = int(round((y + 1) * scale_y))
+                block = pixels[y0:y1, x0:x1]
+                if block.size == 0:
+                    output[y, x] = [0, 0, 0, 0]
+                    continue
+                block_2d = block.reshape(-1, 4)
+                alpha_values = block_2d[:, 3]
+                num_transparent = np.sum(alpha_values == 0)
+                num_opaque = len(alpha_values) - num_transparent
+                if num_transparent > num_opaque:
                     output[y, x] = [0, 0, 0, 0]
                 else:
-                    color_counts = {}
-                    for row in opaque_pixels:
-                        color_tuple = tuple(int(v) for v in row)
-                        color_counts[color_tuple] = color_counts.get(color_tuple, 0) + 1
+                    opaque_pixels = block_2d[block_2d[:, 3] != 0]
+                    if len(opaque_pixels) == 0:
+                        output[y, x] = [0, 0, 0, 0]
+                    else:
+                        color_counts = {}
+                        for row in opaque_pixels:
+                            color_tuple = tuple(int(v) for v in row)
+                            color_counts[color_tuple] = color_counts.get(color_tuple, 0) + 1
+                        majority_color = max(color_counts, key=color_counts.get)
+                        output[y, x] = majority_color
+        return Image.fromarray(output, mode="RGBA")
+    else:
+        if scale_factor < 1:
+            raise ValueError("scale_factor must be >= 1")
+        new_width, new_height = width // scale_factor, height // scale_factor
+        pixels = np.array(img)
+        output = np.zeros((new_height, new_width, 4), dtype=pixels.dtype)
+        for y in range(new_height):
+            for x in range(new_width):
+                block = pixels[
+                    y * scale_factor : (y + 1) * scale_factor,
+                    x * scale_factor : (x + 1) * scale_factor
+                ]
+                block_2d = block.reshape(-1, 4)
+                alpha_values = block_2d[:, 3]
+                num_transparent = np.sum(alpha_values == 0)
+                num_opaque = len(alpha_values) - num_transparent
+                if num_transparent > num_opaque:
+                    output[y, x] = [0, 0, 0, 0]
+                else:
+                    opaque_pixels = block_2d[block_2d[:, 3] != 0]
+                    if len(opaque_pixels) == 0:
+                        output[y, x] = [0, 0, 0, 0]
+                    else:
+                        color_counts = {}
+                        for row in opaque_pixels:
+                            color_tuple = tuple(int(v) for v in row)
+                            color_counts[color_tuple] = color_counts.get(color_tuple, 0) + 1
+                        majority_color = max(color_counts, key=color_counts.get)
+                        output[y, x] = majority_color
+        return Image.fromarray(output, mode="RGBA")
 
-                    # simple majority
-                    majority_color = max(color_counts, key=color_counts.get)
-                    output[y, x] = majority_color
-
-    return Image.fromarray(output, mode="RGBA")
-
-
-
-def refined_edge_preserving_downscale(img, scale_factor, soft_edges, edge_threshold=30):
-    # Ensure RGBA so we handle transparency properly
+def refined_edge_preserving_downscale(img, scale_factor, soft_edges, edge_threshold=30, naive_method=Image.Resampling.LANCZOS, target_width=None, target_height=None):
+    """
+    Downscale with edge preservation. If target_width/target_height are provided, use them for resizing.
+    """
     if img.mode != "RGBA":
         img = img.convert("RGBA")
 
@@ -990,65 +1010,26 @@ def refined_edge_preserving_downscale(img, scale_factor, soft_edges, edge_thresh
     strong_edges = Image.fromarray(edges_data, mode="L")
 
     # 2. Downscale while preserving color
-    downsampled = majority_color_block_sampling(img, scale_factor)  # from your code
-
-    strong_edges = strong_edges.resize(downsampled.size, Image.Resampling.BILINEAR)
+    if target_width is not None and target_height is not None and target_width > 0 and target_height > 0:
+        downsampled = img.resize((target_width, target_height), naive_method).convert("RGBA")
+        strong_edges = strong_edges.resize((target_width, target_height), Image.Resampling.BILINEAR)
+    else:
+        downsampled = naive_downsample(img, scale_factor, method=naive_method)
+        strong_edges = strong_edges.resize(downsampled.size, Image.Resampling.BILINEAR)
 
     # 3. Use a mask-based approach to set only the edge areas
-
-    # Convert the downsampled to RGBA
     color_data = downsampled.convert("RGBA")
-
-    # Step 3a: Add partial opacity to the mask so it doesn't produce pure black
-    # We'll do this by converting edges to RGBA and adjusting alpha.
     mask_rgba = Image.new("RGBA", color_data.size)
     if (soft_edges):
         mask_rgba.putdata([(0, 0, 0, v) for v in strong_edges.getdata()])
     else:
         mask_rgba.putdata([(0, 0, 0, 255 if v > 0 else 0) for v in strong_edges.getdata()])
-    #
-    # Now each pixel has alpha = 0 or 255, matching edge map.
-
-    # Split out the RGBA channels
-    r_c, g_c, b_c, a_c = color_data.split()  # color_data is RGBA
-    r_m, g_m, b_m, a_m = mask_rgba.split()  # mask_rgba is RGBA
-
-    # Merge them so the final image has R/G/B from color_data and A from mask_rgba
+    r_c, g_c, b_c, a_c = color_data.split()
+    r_m, g_m, b_m, a_m = mask_rgba.split()
     final = Image.merge("RGBA", (r_c, g_c, b_c, a_m))
-
     return final
 
-
-def blend_edges_second_pass(img, edge_threshold=30, alpha=0.5):
-    """
-    Blends edges in a separate pass after other operations.
-    """
-    if img.mode != "RGBA":
-        img = img.convert("RGBA")
-
-    # Convert to RGB for edge detection
-    edges = img.convert("RGB").filter(ImageFilter.FIND_EDGES).convert("L")
-    edges_data = np.array(edges)
-    edges_data = np.where(edges_data > edge_threshold, 255, 0).astype(np.uint8)
-    strong_edges = Image.fromarray(edges_data, mode="L")
-
-    # Resize edges
-    edges_resized = strong_edges.resize(img.size, Image.Resampling.BILINEAR)
-
-    # Blend
-    img_gray = img.convert("L")
-    combined = Image.blend(img_gray, edges_resized, alpha)
-
-    # Merge back, preserving original alpha
-    original_alpha = img.split()[-1]
-    return Image.merge("RGBA", (combined, combined, combined, original_alpha))
-
-def paste_img(dest, src) -> Image.Image:
-    new_layer = Image.new("RGBA", dest.size)
-    new_layer.paste(src, (0, 0))
-    return Image.alpha_composite(dest, new_layer)
-
-def main(input_img=None, ds_factor=2, target_width=0, target_height=0, operations=None) -> Image.Image:
+def main(input_img=None, ds_factor=2, target_width=0, target_height=0, operations=None, naive_method=None) -> Image.Image:
     if input_img is None:
         parser = argparse.ArgumentParser(description="Pixel Art Downscaling with RGBA & Small-Sprite Optimizations")
         parser.add_argument("input", help="Path to input image")
@@ -1080,21 +1061,31 @@ def main(input_img=None, ds_factor=2, target_width=0, target_height=0, operation
         ops = [op.strip() for op in args.operations.split(",")]
         downsampled_img = naive_downsample(original_img, args.scale_factor)
     else:
-        # When called from streamlit_main.py, use the provided image.
         from argparse import Namespace
-        # Accept operations from argument if provided
         if operations is not None:
             ops = [op.strip() for op in operations.split(",")]
         else:
             ops = ["1", "2"]
-        args = Namespace(scale_factor=ds_factor, operations=operations or "1,2", edge_threshold=30, palette=None,
-                         soft_edges=False, alpha_min=72, process_outline=None, output="output.png")
+        args = Namespace(
+            scale_factor=ds_factor,
+            operations=operations or "1,2",
+            edge_threshold=30,
+            palette=None,
+            soft_edges=False,
+            alpha_min=72,
+            process_outline=None,
+            output="output.png"
+        )
         original_img = input_img.convert("RGBA")
-        # Use target_width/target_height if provided; otherwise use ds_factor:
+        # Always use target_width/target_height if both are set and >0
         if target_width is not None and target_height is not None and target_width > 0 and target_height > 0:
-            downsampled_img = original_img.resize((target_width, target_height), Image.Resampling.LANCZOS).convert("RGBA")
+            if target_width > original_img.width or target_height > original_img.height:
+                raise ValueError("Target width/height must not exceed original image size.")
+            downsampled_img = original_img.resize((target_width, target_height), naive_method).convert("RGBA")
         else:
-            downsampled_img = naive_downsample(original_img, ds_factor)
+            if ds_factor < 1 or original_img.width // ds_factor < 1 or original_img.height // ds_factor < 1:
+                raise ValueError("Downscale factor too large for image size.")
+            downsampled_img = naive_downsample(original_img, ds_factor, method=naive_method)
 
     external_outline_mask = None
     internal_outline_mask = None
@@ -1146,7 +1137,9 @@ def main(input_img=None, ds_factor=2, target_width=0, target_height=0, operation
         if op == "1":
             result_img = majority_color_block_sampling(
                 img=result_img,
-                scale_factor=args.scale_factor
+                scale_factor=args.scale_factor,
+                target_width=target_width if target_width and target_height else None,
+                target_height=target_height if target_width and target_height else None
             )
             if DIAGNOSTICS:
                 result_img.save('majority_color_block_sampling_' + args.output)
@@ -1156,7 +1149,10 @@ def main(input_img=None, ds_factor=2, target_width=0, target_height=0, operation
                 img=result_img,
                 scale_factor=args.scale_factor,
                 soft_edges=args.soft_edges,
-                edge_threshold=args.edge_threshold
+                edge_threshold=args.edge_threshold,
+                naive_method=naive_method,
+                target_width=target_width if target_width and target_height else None,
+                target_height=target_height if target_width and target_height else None
             )
             if DIAGNOSTICS:
                 result_img.save('refined_edge_preserving_downscale_' + args.output)
@@ -1189,6 +1185,7 @@ def naive_downsample(original_img, scale_factor, method=Image.Resampling.LANCZOS
     d_img = (original_img.resize(
         (original_img.width // scale_factor, original_img.height // scale_factor),
         method).convert("RGBA"))
+    print(method)
     if remove_alpha:
         d_arr = np.array(d_img)
         h, w, _ = d_arr.shape
