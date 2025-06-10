@@ -18,6 +18,7 @@ To run the Streamlit application, make sure you install uv!
 Then navigate to the project directory in your terminal and execute the following commands:
 
 uv pip install -r pyproject.toml
+
 uv run streamlit run streamlit_main.py
 
 TODO: Work on preserving outlines (e.g. as in the Yoshi example).
