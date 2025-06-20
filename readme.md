@@ -2,6 +2,7 @@ A simple test script to experiment with pixel art downscaling.
 
 It attempts to preserve relevant details on downscaling.
 
+## Command Line Tools
 Suggested command lines:
 
 For tiles/large features.
@@ -13,6 +14,7 @@ For characters/fine details/lots of transparency:
 Running the command without parameters will provide help, 
 of a sort, and I'll be filling in this readme as I refine things further.
 
+## Streamlit App
 To run the Streamlit application, make sure you install uv!
 
 Then navigate to the project directory in your terminal and execute the following commands:
@@ -21,4 +23,5 @@ Then navigate to the project directory in your terminal and execute the followin
 
 - `uv run streamlit run streamlit_main.py`
 
+## Notes
 TODO: Work on preserving outlines (e.g. as in the Yoshi example).
